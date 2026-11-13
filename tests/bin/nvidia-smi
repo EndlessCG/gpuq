@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# A stand-in nvidia-smi for the tests: answers the queries gpuq and qtop make from two CSV files.
+#   $FAKE_GPUS: index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit
+#   $FAKE_APPS: gpu_uuid,pid,used_memory   (may be missing or empty)
+fields="" kind="" only=""
+for a in "$@"; do
+  case "$a" in
+    --query-gpu=*) kind=gpu; fields=${a#*=} ;;
+    --query-compute-apps=*) kind=apps; fields=${a#*=} ;;
+    -i) want_i=1 ;;
+    *) [ -n "${want_i:-}" ] && { only=$a; want_i=""; } ;;
+  esac
+done
+if [ "$kind" = gpu ]; then
+  cols="index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit"
+  src=$FAKE_GPUS
+else
+  cols="gpu_uuid,pid,used_memory"
+  src=${FAKE_APPS:-/dev/null}
+fi
+[ -f "$src" ] || exit 0
+awk -F, -v cols="$cols" -v want="$fields" -v only="$only" '
+  BEGIN { n = split(cols, c, ","); for (i = 1; i <= n; i++) pos[c[i]] = i; m = split(want, w, ",") }
+  NF == 0 { next }
+  only != "" && $1 != only { next }
+  { line = ""; for (i = 1; i <= m; i++) line = line (i > 1 ? ", " : "") $(pos[w[i]]); print line }
+' "$src"

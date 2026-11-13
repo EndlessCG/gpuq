@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# gpuq: a GPU lease queue for your jobs (and your AI agents' jobs) on a shared machine.
+# Jobs wait their turn for free cards instead of piling onto busy ones. State: ~/.gpuq (or $GPUQ_DIR).
+#
+#   gpuq run [-n N] [--low|--high] [--gpus "0 1"] [--note TEXT] [--eta DUR] -- CMD...
+#       Wait for N free cards, then run CMD on them (CUDA_VISIBLE_DEVICES set). CMD takes over this
+#       process, so the lease lasts exactly as long as CMD, however it ends.
+#   gpuq acquire N [--owner PID] [--low|--high] [--note TEXT] [--eta DUR]
+#       Print N leased cards (comma-separated); the lease lasts while PID (default: the caller) lives.
+#   gpuq note [--owner PID] [--note TEXT] [--eta DUR]   attach or change a job's note / ETA
+#   gpuq release [--owner PID]                          free PID's cards now (a dead PID's are ignored anyway)
+#   gpuq status                                         cards, who holds them, waiting jobs, caps
+#   gpuq cap [--total N] [--lease N] [--exclude "3 5"]  show or set the caps and the excluded cards
+#   gpuq prio PID --high [--top | --pos K]              put a waiting job on the priority list (end, first, K-th)
+#   gpuq prio PID --normal | --low                      move a waiting job to the normal / low class
+#   gpuq top [-d SEC] [--once]                          live top-like view (qtop); its keys change priorities too
+#
+#   --note: a few words saying what the job is.  --eta: how long it runs once it has its cards
+#   (45m, 2h, 1h30m, 1d2h); status shows time used and time left against it.
+#
+# A card is free when no process of yours runs on it, no live lease holds it, it isn't excluded,
+# and it uses under $GPUQ_FREE_MIB MiB (default 5000). --low jobs wait while any normal job waits;
+# --high puts a job on the priority list, whose first waiting job leases before everyone else, one
+# card at a time as they free up. `gpuq prio` and qtop change a waiting job's class or place.
+# no set -e: the queue library relies on non-zero tests inside its loops
+source "${GPUQ_LIB:-$(dirname "$(realpath "$0")")/../lib/gpuq.sh}"
+
+usage() { sed -n '2,/^# no set -e/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit "${1:-0}"; }
+bad() { echo "gpuq: $1 (see gpuq --help)" >&2; exit 2; }
+need_nvidia_smi() {
+  command -v nvidia-smi >/dev/null || { echo "gpuq: nvidia-smi isn't on PATH, so the cards can't be seen" >&2; exit 1; }
+}
+
+# Notes and ETAs: $PIDS/gpu_meta/<pid> holds the pid's start time, the ETA and the note, one per line.
+# The start time ties the file to that process, so a reused pid never shows a stale note.
+eta_seconds() {  # 45m / 2h / 1h30m / 1d2h -> seconds; fails on any other form
+  [[ -n $1 && $1 =~ ^(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?$ ]] || return 1
+  echo $(( ${BASH_REMATCH[2]:-0}*86400 + ${BASH_REMATCH[4]:-0}*3600 + ${BASH_REMATCH[6]:-0}*60 ))
+}
+fmt_dur() {  # seconds -> 1d02h05m / 2h05m
+  local s=$1
+  [ "$s" -ge 86400 ] && printf '%dd' $((s/86400))
+  printf '%dh%02dm' $((s%86400/3600)) $((s%3600/60))
+}
+meta_read() {  # pid -> M_NOTE, M_ETA (empty when absent or left by an earlier process with this pid)
+  local f="$PIDS/gpu_meta/$1"; M_NOTE=""; M_ETA=""
+  [ -f "$f" ] && [ "$(sed -n 1p "$f")" = "$(ps -o lstart= -p "$1")" ] || return 0
+  M_ETA=$(sed -n 2p "$f"); M_NOTE=$(sed -n 3p "$f")
+}
+meta_write() {  # pid: store NOTE/ETA (unset = keep the current value)
+  local p=$1 note eta
+  meta_read "$p"; note=${NOTE-$M_NOTE}; eta=${ETA-$M_ETA}; note=${note//$'\n'/ }
+  if [ -n "$eta" ] && ! eta_seconds "$eta" >/dev/null; then
+    echo "gpuq: bad --eta '$eta' (use e.g. 45m, 2h, 1h30m, 1d2h)" >&2; exit 2
+  fi
+  mkdir -p "$PIDS/gpu_meta"
+  printf '%s\n%s\n%s\n' "$(ps -o lstart= -p "$p")" "$eta" "$note" > "$PIDS/gpu_meta/$p"
+}
+meta_desc() {  # pid [lease start, epoch s] -> " — note · eta 2h (1h10m in, ~0h50m left)"
+  local p=$1 t0=${2:-} out="" e left
+  meta_read "$p"
+  [ -n "$M_NOTE" ] && out=" — $M_NOTE"
+  if [ -n "$M_ETA" ]; then
+    out+=" · eta $M_ETA"
+    if [ -n "$t0" ]; then
+      e=$(( $(date +%s) - t0 )); left=$(( $(eta_seconds "$M_ETA") - e ))
+      if [ "$left" -ge 0 ]; then out+=" ($(fmt_dur "$e") in, ~$(fmt_dur "$left") left)"
+      else out+=" ($(fmt_dur "$e") in, $(fmt_dur $((-left))) over)"; fi
+    fi
+  fi
+  printf '%s' "$out"
+}
+
+class_flags() {  # sets GPU_PRIORITY_CLASS / HIGH from --low/--high
+  case "$1" in
+    --low) export GPUQ_CLASS=low ;;
+    --high) HIGH=1 ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_status() {
+  local cap lease idx used util holder r w p held t0 desc
+  held=$(gpu_held_indices)  # once for all cards: each call runs nvidia-smi
+  local excluded; excluded=" $(gpu_excluded | tr ',\n' '  ') "
+  cap=$(gpu_cap_value); lease=$(cat "$PIDS/gpu_lease_cap" 2>/dev/null || echo "none")
+  echo "caps: total=$cap  leases=$lease (used $(gpu_reserved_count))  excluded:$(gpu_excluded | tr ',\n' '  ' | sed 's/^/ /;s/^ *$/ none/')   state: $PIDS"
+  printf '%-4s %-10s %-5s %s\n' GPU MEM_MiB UTIL HOLDER
+  while IFS=, read -r idx used util; do
+    idx=${idx// /}; holder=""
+    [[ $excluded == *" $idx "* ]] && holder="(excluded)"
+    r="$PIDS/gpu_reservations/gpu$idx"
+    if [ -f "$r" ] && gpu_alive "$(cat "$r")"; then
+      p=$(cat "$r")
+      if [ -f "$PIDS/gpu_waiting/$p" ]; then t0=""   # a priority head still collecting cards: not running yet
+      else t0=$(stat -c %Y $(grep -lx "$p" "$PIDS"/gpu_reservations/gpu*) | sort -n | head -1); fi
+      desc=$(meta_desc "$p" "$t0"); meta_read "$p"   # meta_desc ran in a subshell: read M_NOTE here
+      [ -n "$M_NOTE" ] || desc=": $(ps -o args= -p "$p" | cut -c1-90)$desc"   # no note: show the command
+      holder="lease pid $p$desc"
+    elif grep -qx "$idx" <<< "$held"; then
+      holder="unleased process (user or external)"
+    fi
+    printf '%-4s %-10s %-5s %s\n' "$idx" "${used// /}" "${util// /}" "$holder"
+  done < <(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits)
+  # Waiters in the order the queue serves them (see lib.sh): the priority list in file order (only
+  # its first live waiter leases, card by card), then normal jobs, then low jobs (which wait while
+  # any normal job waits). Normal/low jobs are not first-come: the first to find enough free cards
+  # wins, so they are listed by arrival without a rank.
+  local prio=() normal=() low=() k=0
+  if [ -f "$PIDS/gpu_priority" ]; then
+    while read -r p; do
+      [ -n "$p" ] && gpu_alive "$p" && [ -f "$PIDS/gpu_waiting/$p" ] && prio+=("$p")
+    done < "$PIDS/gpu_priority"
+  fi
+  for w in $(ls -tr "$PIDS"/gpu_waiting/ 2>/dev/null); do
+    gpu_alive "$w" || continue
+    [[ " ${prio[*]} " == *" $w "* ]] && continue
+    if [ "$(cat "$PIDS/gpu_waiting/$w")" = low ]; then low+=("$w"); else normal+=("$w"); fi
+  done
+  echo "queue (served top to bottom):"
+  [ $(( ${#prio[@]} + ${#normal[@]} + ${#low[@]} )) -eq 0 ] && echo "  (empty)"
+  for p in "${prio[@]}"; do k=$((k+1)); waiter_line "$p" "#$k priority"; done
+  [ ${#normal[@]} -gt 0 ] && [ ${#prio[@]} -gt 0 ] && echo "  -- after the priority list: normal jobs, first to find enough free cards wins --"
+  for p in "${normal[@]}"; do waiter_line "$p" "normal"; done
+  [ ${#low[@]} -gt 0 ] && echo "  -- low: wait while any normal job waits --"
+  for p in "${low[@]}"; do waiter_line "$p" "low"; done
+}
+
+waiter_line() {  # pid label: cards needed / already reserved, time waiting, the queued command
+  local p=$1 need got age args
+  need=$(cat "$PIDS/gpu_need/$p" 2>/dev/null || echo "?")   # "?" for jobs queued before gpu_need existed
+  got=$(grep -lx "$p" "$PIDS"/gpu_reservations/gpu* 2>/dev/null | sed 's#.*/gpu##' | paste -sd, -)
+  age=$(( ($(date +%s) - $(stat -c %Y "$PIDS/gpu_waiting/$p")) / 60 ))
+  args=$(ps -o args= -p "$p")
+  [[ $args == *"gpuq run "*" -- "* ]] && args=${args#* -- }   # show the job, not the gpuq wrapper
+  printf '  %-11s pid %-8s needs %s%s  waiting %dh%02dm%s\n      %s\n' \
+    "$2" "$p" "$need" "${got:+ (holds GPU $got)}" $((age/60)) $((age%60)) "$(meta_desc "$p")" "$args"
+}
+
+cmd_acquire() {
+  local n=${1:-}
+  [[ $n =~ ^[1-9][0-9]*$ ]] || bad "acquire needs a number of cards, e.g. gpuq acquire 2"
+  shift
+  local owner=$PPID
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --owner) owner=$2; shift 2 ;;
+      --gpus) export GPUQ_CANDIDATES=$2; shift 2 ;;
+      --note) NOTE=$2; shift 2 ;;
+      --eta) ETA=$2; shift 2 ;;
+      *) class_flags "$1" || bad "unknown option $1"; shift ;;
+    esac
+  done
+  [ -n "${NOTE+x}${ETA+x}" ] && meta_write "$owner"
+  [ "${HIGH:-0}" = 1 ] && echo "$owner" >> "$PIDS/gpu_priority"
+  gpu_acquire_n "$owner" "$n"
+}
+
+cmd_note() {
+  local owner=$PPID
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --owner) owner=$2; shift 2 ;;
+      --note) NOTE=$2; shift 2 ;;
+      --eta) ETA=$2; shift 2 ;;
+      *) usage 1 ;;
+    esac
+  done
+  gpu_alive "$owner" || { echo "gpuq: pid $owner is not running" >&2; exit 1; }
+  [ -n "${NOTE+x}${ETA+x}" ] || usage 1
+  meta_write "$owner"
+}
+
+cmd_run() {
+  local n=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n) [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || bad "-n needs a number of cards"; n=$2; shift 2 ;;
+      --gpus) export GPUQ_CANDIDATES=$2; shift 2 ;;
+      --note) NOTE=$2; shift 2 ;;
+      --eta) ETA=$2; shift 2 ;;
+      --) shift; break ;;
+      *) class_flags "$1" || bad "unknown option $1"; shift ;;
+    esac
+  done
+  [ $# -gt 0 ] || bad "nothing to run: put the command after --"
+  # This shell owns the lease, then becomes the command (exec keeps the PID): the lease lives
+  # exactly as long as the job, even if it's killed with -9. While it waits, a release on exit
+  # takes it out of the queue.
+  local owner=$$ cards
+  [ -n "${NOTE+x}${ETA+x}" ] && meta_write "$owner"
+  trap 'gpu_release '"$owner"' 2>/dev/null || true' EXIT
+  [ "${HIGH:-0}" = 1 ] && echo "$owner" >> "$PIDS/gpu_priority"
+  echo "gpuq: waiting for $n card(s) [class $GPUQ_CLASS${HIGH:+, priority}] for: $*" >&2
+  cards=$(gpu_acquire_n "$owner" "$n") || exit 1
+  echo "gpuq: leased GPU(s) $cards" >&2
+  trap - EXIT
+  CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$cards exec "$@"
+}
+
+# Change a waiting job's priority. PID is the lease owner shown by `gpuq status` / qtop.
+# --high: into the priority list (appended, or at live position K; --top = --pos 1), class reset to normal
+# so it is a normal job if it later leaves the list. --normal / --low: out of the priority list, and any
+# cards it had reserved as the priority head (collected one at a time) go back to the pool.
+# The waiter re-reads its class and the list on every poll, so the change applies at its next poll.
+cmd_prio() {
+  local p=${1:-} cls="" pos=""
+  [[ $p =~ ^[0-9]+$ ]] || usage 1
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --high|--normal|--low) cls=${1#--}; shift ;;
+      --top) pos=1; shift ;;
+      --pos) pos=${2:-}; shift 2 || usage 1 ;;
+      *) usage 1 ;;
+    esac
+  done
+  if [ -n "$pos" ]; then
+    [[ $pos =~ ^[1-9][0-9]*$ ]] || usage 1
+    [ -z "$cls" ] && cls=high
+    [ "$cls" = high ] || { echo "gpuq: --top/--pos only apply to --high" >&2; exit 2; }
+  fi
+  [ -n "$cls" ] || usage 1
+  local f="$PIDS/gpu_priority" w="$PIDS/gpu_waiting/$p" t q k=0 placed=0 r
+  local -a out=()
+  exec 8>"$PIDS/gpu_launch.lock"; flock 8
+  if ! gpu_alive "$p" || [ ! -f "$w" ]; then
+    flock -u 8; exec 8>&-
+    echo "gpuq: pid $p is not waiting in the queue (see gpuq status)" >&2; exit 1
+  fi
+  t=$(stat -c %Y "$w")
+  if [ "$cls" = high ]; then
+    echo normal > "$w"
+    # Rebuild the list: drop dead pids and p itself, then insert p before the pos-th live waiting
+    # entry (entries alive but not yet waiting, e.g. a --high job still starting, keep their place).
+    if [ -f "$f" ]; then
+      while read -r q; do
+        [ -n "$q" ] && [ "$q" != "$p" ] && gpu_alive "$q" || continue
+        if [ -f "$PIDS/gpu_waiting/$q" ]; then
+          k=$((k+1))
+          if [ -n "$pos" ] && [ "$placed" = 0 ] && [ "$k" -ge "$pos" ]; then out+=("$p"); placed=1; fi
+        fi
+        out+=("$q")
+      done < "$f"
+    fi
+    [ "$placed" = 1 ] || out+=("$p")
+    printf '%s\n' "${out[@]}" > "$f.tmp" && mv "$f.tmp" "$f"
+  else
+    echo "$cls" > "$w"
+    [ -f "$f" ] && sed -i "/^$p\$/d" "$f"
+    for r in "$PIDS"/gpu_reservations/gpu*; do
+      [ -f "$r" ] && [ "$(cat "$r")" = "$p" ] && rm -f "$r"
+    done
+  fi
+  touch -d "@$t" "$w"   # keep its arrival time (status lists normal/low waiters by arrival)
+  flock -u 8; exec 8>&-
+  if [ "$cls" = high ]; then
+    k=0; for q in "${out[@]}"; do [ -f "$PIDS/gpu_waiting/$q" ] && k=$((k+1)); [ "$q" = "$p" ] && break; done
+    echo "gpuq: pid $p -> high, priority #$k"
+  else
+    echo "gpuq: pid $p -> $cls"
+  fi
+}
+
+# --total: most cards your jobs may hold at once (counting your processes outside gpuq too).
+# --lease: most cards leased through gpuq at once. --exclude: cards never leased ("" clears).
+cmd_cap() {
+  if [ $# -eq 0 ]; then
+    echo "total=$(gpu_cap_value)  leases=$(cat "$PIDS/gpu_lease_cap" 2>/dev/null || echo none)  excluded=$(gpu_excluded | tr ',\n' '  ' | sed 's/ *$//;s/^$/none/')"
+    return
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --lease|--total) [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "gpuq: $1 needs a number" >&2; exit 2; } ;;&
+      --lease) echo "$2" > "$PIDS/gpu_lease_cap"; shift 2 ;;
+      --total) echo "$2" > "$PIDS/gpu_cap"; shift 2 ;;
+      --exclude)
+        [[ ${2-x} =~ ^[0-9\ ,]*$ ]] || { echo "gpuq: --exclude takes card numbers, e.g. \"3\" or \"3 5\"" >&2; exit 2; }
+        if [ -z "${2// /}" ]; then rm -f "$PIDS/gpu_exclude"; else echo "$2" > "$PIDS/gpu_exclude"; fi
+        shift 2 ;;
+      *) usage 1 ;;
+    esac
+  done
+}
+
+sub=${1:-}; shift || true
+case "$sub" in run|acquire|status|top) need_nvidia_smi ;; esac
+case "$sub" in
+  run) cmd_run "$@" ;;
+  acquire) cmd_acquire "$@" ;;
+  note) cmd_note "$@" ;;
+  release) owner=$PPID; [ "${1:-}" = --owner ] && owner=$2; gpu_release "$owner" ;;
+  status) cmd_status ;;
+  cap) cmd_cap "$@" ;;
+  prio) cmd_prio "$@" ;;
+  top) exec "${QTOP_BIN:-$(dirname "$(realpath "$0")")/qtop}" "$@" ;;
+  --version|version) echo "gpuq 1.0.0" ;;
+  -h|--help|help|"") usage 0 ;;
+  *) bad "unknown command $sub" ;;
+esac

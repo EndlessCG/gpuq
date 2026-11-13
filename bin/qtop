@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""qtop: live, top-like view of the gpuq GPU queue -- cards, leases, GPU processes, waiting jobs.
+
+Reads the same state as `gpuq status` (${GPUQ_DIR:-~/.gpuq}); priority changes go through
+`gpuq prio`, so the queue logic lives in one place (lib/gpuq.sh).
+
+Keys:  up/down or j/k  select a waiting job      H  high: end of the priority list
+       T  top of the priority list                N / L  normal / low class
+       [ / ]  move up / down in the priority list p  show / hide GPU processes
+       PgUp / PgDn  scroll       r  refresh now    q  quit
+`qtop --once` prints one plain snapshot (like `top -b -n 1`).
+"""
+import argparse
+import curses
+import locale
+import os
+import pwd
+import shutil
+import socket
+import subprocess
+import time
+from dataclasses import dataclass, field
+
+STATE = os.environ.get("GPUQ_DIR", os.path.expanduser("~/.gpuq"))
+GPUQ = os.environ.get("GPUQ_BIN", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gpuq"))
+# The same settings lib/gpuq.sh reads: cards never leased ($GPUQ_DIR/gpu_exclude), and the used
+# memory below which a card counts as free ($GPUQ_FREE_MIB).
+def _excluded():
+    try:
+        with open(os.path.join(STATE, "gpu_exclude")) as f:
+            return {int(x) for x in f.read().replace(",", " ").split() if x.isdigit()}
+    except FileNotFoundError:
+        return set()
+
+
+EXCLUDED = _excluded()
+HOST_LABEL = os.environ.get("GPUQ_HOST_LABEL") or socket.gethostname()  # what the header calls this machine
+FREE_MIB = int(os.environ.get("GPUQ_FREE_MIB", "5000"))
+ME = pwd.getpwuid(os.getuid()).pw_name
+
+
+def sh(*cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+
+
+def num(s):
+    """nvidia-smi field -> float, None for '[N/A]' / '[Not Supported]'."""
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def read_text(path):
+    """File contents, or None if it vanished (the queue removes state files as jobs lease/exit)."""
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def ls(d):
+    try:
+        return os.listdir(d)
+    except FileNotFoundError:
+        return []
+
+
+def fmt_dur(s):
+    s = int(s)
+    d = f"{s // 86400}d" if s >= 86400 else ""
+    return f"{d}{s % 86400 // 3600}h{s % 3600 // 60:02d}m"
+
+
+def eta_seconds(eta):
+    """45m / 2h / 1h30m / 1d2h -> seconds (same grammar as gpuq --eta); None if unparsable."""
+    total, n = 0, ""
+    for ch in eta:
+        if ch.isdigit():
+            n += ch
+        elif ch in "dhm" and n:
+            total += int(n) * {"d": 86400, "h": 3600, "m": 60}[ch]
+            n = ""
+        else:
+            return None
+    return total if eta and not n else None
+
+
+@dataclass
+class Proc:
+    pid: int
+    ppid: int
+    user: str
+    lstart: str
+    args: str
+
+
+@dataclass
+class Gpu:
+    idx: int
+    name: str
+    used: float
+    total: float
+    util: float
+    temp: float
+    power: float
+    plimit: float
+    apps: list = field(default_factory=list)  # (pid, MiB)
+
+
+@dataclass
+class Snap:
+    t: float
+    gpus: list
+    procs: dict
+    cap_total: str
+    cap_lease: str
+    leases: dict       # gpu idx -> owner pid (live reservations only)
+    lease_t0: dict     # owner pid -> earliest reservation mtime
+    queue: list        # (pid, label, rank-in-priority or None)
+    waiting: dict      # pid -> class
+    need: dict         # pid -> cards needed (str)
+    arrived: dict      # pid -> arrival time
+    meta: dict         # pid -> (eta, note)
+
+
+def collect():
+    procs = {}
+    for line in sh("ps", "-ww", "-eo", "pid=,ppid=,user:32=,lstart=,args=").splitlines():
+        f = line.split(None, 8)
+        if len(f) < 8:
+            continue
+        procs[int(f[0])] = Proc(int(f[0]), int(f[1]), f[2], " ".join(f[3:8]), f[8] if len(f) > 8 else "")
+
+    gpus, by_uuid = [], {}
+    q = "index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit"
+    for line in sh("nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        g = Gpu(int(f[0]), f[2].replace("NVIDIA ", ""), *(num(x) for x in f[3:9]))
+        gpus.append(g)
+        by_uuid[f[1]] = g
+    for line in sh("nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
+                   "--format=csv,noheader,nounits").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if f[0] in by_uuid:
+            by_uuid[f[0]].apps.append((int(f[1]), num(f[2])))
+
+    alive = lambda p: p in procs
+    leases, lease_t0 = {}, {}
+    rdir = os.path.join(STATE, "gpu_reservations")
+    for name in ls(rdir):
+        txt = read_text(os.path.join(rdir, name))
+        if not (name.startswith("gpu") and txt and txt.strip().isdigit()):
+            continue
+        p = int(txt.strip())
+        if alive(p):
+            leases[int(name[3:])] = p
+            mt = mtime(os.path.join(rdir, name))
+            if mt is not None:
+                lease_t0[p] = min(lease_t0.get(p, mt), mt)
+
+    waiting, need, arrived = {}, {}, {}
+    for name in ls(os.path.join(STATE, "gpu_waiting")):
+        if not name.isdigit() or not alive(int(name)):
+            continue
+        p = int(name)
+        cls = read_text(os.path.join(STATE, "gpu_waiting", name))
+        if cls is None:
+            continue
+        waiting[p] = cls.strip()
+        need[p] = (read_text(os.path.join(STATE, "gpu_need", name)) or "?").strip()
+        arrived[p] = mtime(os.path.join(STATE, "gpu_waiting", name)) or time.time()
+
+    meta = {}
+    for p in set(leases.values()) | set(waiting):
+        lines = (read_text(os.path.join(STATE, "gpu_meta", str(p))) or "").split("\n")
+        if len(lines) >= 3 and " ".join(lines[0].split()) == procs[p].lstart:
+            meta[p] = (lines[1].strip(), lines[2].strip())
+
+    # Serving order, as in `gpuq status`: the priority list (live waiters, file order), then normal
+    # jobs, then low jobs; normal/low are not first-come, so they are shown by arrival without a rank.
+    prio = []
+    for line in (read_text(os.path.join(STATE, "gpu_priority")) or "").split():
+        if line.isdigit() and int(line) in waiting and int(line) not in prio:
+            prio.append(int(line))
+    queue = [(p, f"#{i + 1} high", i + 1) for i, p in enumerate(prio)]
+    rest = sorted((p for p in waiting if p not in prio), key=lambda p: arrived[p])
+    queue += [(p, "normal", None) for p in rest if waiting[p] != "low"]
+    queue += [(p, "low", None) for p in rest if waiting[p] == "low"]
+
+    cap = lambda n, default: (read_text(os.path.join(STATE, n)) or default).strip()
+    return Snap(time.time(), gpus, procs, cap("gpu_cap", str(len(gpus))), cap("gpu_lease_cap", "none"), leases, lease_t0,
+                queue, waiting, need, arrived, meta)
+
+
+# ---------------------------------------------------------------- rendering (style-tagged rows)
+
+@dataclass
+class Row:
+    segs: list                 # (text, style)
+    pid: int = None            # selectable waiting job
+
+
+def bar(frac, width):
+    k = 0 if frac is None else max(0, min(width, round(frac * width)))
+    return "█" * k + "░" * (width - k)
+
+
+def level(frac):
+    return "dim" if frac is None else "red" if frac >= 0.9 else "yellow" if frac >= 0.5 else "green"
+
+
+def lease_owner_of(pid, snap):
+    """The lease owner among pid's ancestors (gpuq run wraps the job), or None."""
+    owners, seen = set(snap.leases.values()), set()
+    while pid in snap.procs and pid not in seen:
+        if pid in owners:
+            return pid
+        seen.add(pid)
+        pid = snap.procs[pid].ppid
+    return None
+
+
+def job_args(pid, snap):
+    a = snap.procs[pid].args if pid in snap.procs else "?"
+    if "gpuq run " in a and " -- " in a:
+        a = a.split(" -- ", 1)[1]   # show the job, not the gpuq wrapper
+    return a
+
+
+def eta_text(pid, snap, t0):
+    eta, note = snap.meta.get(pid, ("", ""))
+    out = ""
+    if eta:
+        out = f"eta {eta}"
+        es = eta_seconds(eta)
+        if t0 is not None and es is not None:
+            e = snap.t - t0
+            left = es - e
+            out += f" ({fmt_dur(e)} in, ~{fmt_dur(left)} left)" if left >= 0 else \
+                   f" ({fmt_dur(e)} in, {fmt_dur(-left)} over)"
+    return note, out
+
+
+def build_rows(snap, width, show_procs):
+    rows = []
+    n_leases = len(set(snap.leases))
+    rows.append(Row([(f"caps: total {snap.cap_total} · leases {n_leases}/{snap.cap_lease}"
+                      f" · {len(snap.queue)} waiting", "bold")]))
+    rows.append(Row([("", None)]))
+    bw = max(8, min(24, (width - 78) // 2))
+    rows.append(Row([(f"{'GPU':>3}  {'MEMORY':<{bw + 13}} {'UTIL':<{bw + 5}} {'TEMP':>4} {'POWER':>5}  HOLDER",
+                      "header")]))
+    for g in snap.gpus:
+        mf = g.used / g.total if g.used is not None and g.total else None
+        uf = g.util / 100 if g.util is not None else None
+        mem = f" {g.used / 1024:5.1f}/{g.total / 1024:3.0f}G" if mf is not None else " " * 11
+        segs = [(f"{g.idx:>3}  ", "bold"), (bar(mf, bw), level(mf)), (mem + "  ", None),
+                (bar(uf, bw), level(uf)), (f" {g.util or 0:3.0f}%", None),
+                (f" {g.temp or 0:3.0f}C {g.power or 0:4.0f}W  ", "dim")]
+        mine = [p for p, _ in g.apps if p in snap.procs and snap.procs[p].user == ME]
+        if g.idx in EXCLUDED:
+            segs.append(("excluded", "dim"))
+        elif g.idx in snap.leases:
+            p = snap.leases[g.idx]
+            t0 = None if p in snap.waiting else snap.lease_t0.get(p)  # head still collecting cards
+            note, eta = eta_text(p, snap, t0)
+            segs += [(f"lease {p} ", "cyan"), (note or job_args(p, snap), None),
+                     (f"  {eta}" if eta else "", "dim")]
+        elif mine or g.apps:
+            users = sorted({snap.procs[p].user for p, _ in g.apps if p in snap.procs})
+            segs.append((f"unleased: {', '.join(users) or '?'} ({len(g.apps)} proc)", "yellow"))
+        elif g.used is not None and g.used < FREE_MIB:
+            segs.append(("free", "green"))
+        else:
+            segs.append((f"busy, no visible process ({g.used:.0f} MiB)", "yellow"))
+        rows.append(Row(segs))
+
+    if show_procs:
+        rows.append(Row([("", None)]))
+        rows.append(Row([(f"{'GPU':>3}  {'PID':>8}  {'USER':<10} {'MEM':>8}  {'LEASE':>8}  COMMAND", "header")]))
+        n = 0
+        for g in snap.gpus:
+            for p, mib in sorted(g.apps, key=lambda a: -(a[1] or 0)):
+                pr = snap.procs.get(p)
+                owner = lease_owner_of(p, snap)
+                rows.append(Row([(f"{g.idx:>3}  {p:>8}  {(pr.user if pr else '?')[:10]:<10} "
+                                  f"{(mib or 0) / 1024:7.1f}G  {owner or '-':>8}  ", None),
+                                 (pr.args if pr else "(not visible)", "dim")]))
+                n += 1
+        if n == 0:
+            rows.append(Row([("  (no GPU processes)", "dim")]))
+
+    rows.append(Row([("", None)]))
+    rows.append(Row([("QUEUE (served top to bottom; normal/low: first to find enough free cards wins)",
+                      "header")]))
+    if not snap.queue:
+        rows.append(Row([("  (empty)", "dim")]))
+    for p, label, rank in snap.queue:
+        held = sorted(i for i, o in snap.leases.items() if o == p)
+        note, eta = eta_text(p, snap, None)
+        wait = fmt_dur(snap.t - snap.arrived[p])
+        style = "magenta" if rank else ("dim" if label == "low" else None)
+        rows.append(Row([(f"  {label:<8} ", style), (f"pid {p:<8} ", "cyan"),
+                         (f"needs {snap.need[p]}{' (holds GPU ' + ','.join(map(str, held)) + ')' if held else ''}"
+                          f"  waiting {wait}  ", None),
+                         (note, "bold"), (f"  {eta}" if eta else "", "dim")], pid=p))
+        rows.append(Row([("             " + job_args(p, snap), "dim")], pid=p))
+    return rows
+
+
+def plain(snap, width):
+    head = f"qtop — {HOST_LABEL}  {time.strftime('%H:%M:%S', time.localtime(snap.t))}"
+    lines = [head] + ["".join(t for t, _ in r.segs)[:width] for r in build_rows(snap, width, True)]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- curses UI
+
+def init_styles():
+    styles = {None: curses.A_NORMAL, "bold": curses.A_BOLD, "dim": curses.A_DIM,
+              "header": curses.A_BOLD | curses.A_UNDERLINE}
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+        for i, (name, c) in enumerate([("green", curses.COLOR_GREEN), ("yellow", curses.COLOR_YELLOW),
+                                       ("red", curses.COLOR_RED), ("cyan", curses.COLOR_CYAN),
+                                       ("magenta", curses.COLOR_MAGENTA)], start=1):
+            curses.init_pair(i, c, -1)
+            styles[name] = curses.color_pair(i)
+    else:
+        styles.update({k: curses.A_NORMAL for k in ("green", "yellow", "red", "cyan", "magenta")})
+    return styles
+
+
+def put(win, y, x, text, attr, width):
+    """Write text clipped to the line; curses raises when a write ends in the bottom-right cell."""
+    if x >= width - 1 or not text:
+        return x
+    text = text[:width - 1 - x]
+    try:
+        win.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+    return x + len(text)
+
+
+def prio_cmd(pid, *flags):
+    r = subprocess.run([GPUQ, "prio", str(pid), *flags], capture_output=True, text=True)
+    return (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else f"exit {r.returncode}"
+
+
+def tui(stdscr, delay):
+    curses.curs_set(0)
+    stdscr.timeout(100)
+    styles = init_styles()
+    snap, last = collect(), time.time()
+    sel, offset, show_procs, msg = None, 0, True, ""
+    while True:
+        if time.time() - last >= delay:
+            snap, last = collect(), time.time()
+        h, w = stdscr.getmaxyx()
+        rows = build_rows(snap, w, show_procs)
+        pids = list(dict.fromkeys(r.pid for r in rows if r.pid))
+        if sel not in pids:
+            sel = pids[0] if pids else None
+        body = max(1, h - 2)
+        sel_idx = [i for i, r in enumerate(rows) if r.pid == sel and sel is not None]
+        if sel_idx:
+            if sel_idx[0] < offset:
+                offset = sel_idx[0]
+            elif sel_idx[-1] >= offset + body:
+                offset = sel_idx[-1] - body + 1
+        offset = max(0, min(offset, max(0, len(rows) - body)))
+
+        stdscr.erase()
+        title = (f" qtop — {HOST_LABEL}  {time.strftime('%H:%M:%S', time.localtime(snap.t))}"
+                 f"  (every {delay:g}s)")
+        put(stdscr, 0, 0, title, styles["bold"], w)
+        # The selected job is marked with an arrow in its first line's left margin, not highlighted.
+        for y, r in enumerate(rows[offset:offset + body], start=1):
+            x = 0
+            for text, st in r.segs:
+                x = put(stdscr, y, x, text, styles[st], w)
+            if sel_idx and offset + y - 1 == sel_idx[0]:
+                put(stdscr, y, 0, "▶", styles["cyan"] | curses.A_BOLD, w)
+        keys = "↑↓ select  H high  T top  N normal  L low  [ ] move  p procs  r refresh  q quit"
+        put(stdscr, h - 1, 0, (f" {msg}   " if msg else " ") + keys, styles["dim"], w)
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        key = chr(ch) if 0 <= ch < 256 else ""
+        rank = next((rk for p, _, rk in snap.queue if p == sel), None)
+        act = None
+        if key in ("q", "Q", "\x1b"):
+            return
+        elif ch in (curses.KEY_DOWN,) or key == "j":
+            if sel in pids and pids.index(sel) + 1 < len(pids):
+                sel = pids[pids.index(sel) + 1]
+        elif ch in (curses.KEY_UP,) or key == "k":
+            if sel in pids and pids.index(sel) > 0:
+                sel = pids[pids.index(sel) - 1]
+        elif ch == curses.KEY_NPAGE:
+            offset += body
+        elif ch == curses.KEY_PPAGE:
+            offset = max(0, offset - body)
+        elif key == "p":
+            show_procs = not show_procs
+        elif key == "r":
+            last = 0
+        elif sel is None and key and key in "HhTtNnLl[]":
+            msg = "queue is empty"
+        elif key in ("H", "h"):
+            act = ("--high",)
+        elif key in ("T", "t"):
+            act = ("--high", "--top")
+        elif key in ("N", "n"):
+            act = ("--normal",)
+        elif key in ("L", "l"):
+            act = ("--low",)
+        elif key in ("[", "]"):
+            if rank is None:
+                msg = f"pid {sel} is not in the priority list (H adds it)"
+            else:
+                act = ("--high", "--pos", str(max(1, rank - 1) if key == "[" else rank + 1))
+        elif ch == curses.KEY_RESIZE:
+            pass
+        if act:
+            msg = prio_cmd(sel, *act)
+            last = 0   # re-read the queue right away
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-d", "--delay", type=float, default=2.0, help="refresh interval in seconds (default 2)")
+    ap.add_argument("--once", action="store_true", help="print one plain snapshot and exit")
+    a = ap.parse_args()
+    if a.once:
+        print(plain(collect(), shutil.get_terminal_size((200, 50)).columns))
+        return
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(tui, a.delay)
+
+
+if __name__ == "__main__":
+    main()
