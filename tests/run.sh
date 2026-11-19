@@ -156,7 +156,8 @@ wait
 check "an unpaused job runs" test "$(tail -1 "$order")" = first
 
 setup 20000 20000
-gpuq run -- bash -c 'echo "$CUDA_VISIBLE_DEVICES" > '"$GPUQ_DIR/assigned" 2>/dev/null & job=$!
+# The assigned job keeps its card a while, so the check below sees who took card 1 first.
+gpuq run -- bash -c 'echo "$CUDA_VISIBLE_DEVICES" > '"$GPUQ_DIR/assigned"'; sleep 3' 2>/dev/null & job=$!
 sleep 0.5
 check "assign rejects a card that doesn't exist" bash -c "! gpuq assign $job 7 2>/dev/null"
 gpuq assign $job 1 >/dev/null
@@ -164,11 +165,10 @@ check "status shows the assignment" bash -c "gpuq status | grep -q 'pid $job .*a
 gpuq run -- bash -c 'echo "$CUDA_VISIBLE_DEVICES" > '"$GPUQ_DIR/other" 2>/dev/null & other=$!
 sleep 0.5
 sed -i 's/^1,GPU-1,NVIDIA Test,20000/1,GPU-1,NVIDIA Test,0/' "$FAKE_GPUS"
-wait $job
+for _ in $(seq 50); do [ -s "$GPUQ_DIR/assigned" ] && break; sleep 0.2; done
 check "an assigned job leases its card once it is free" test "$(cat "$GPUQ_DIR/assigned")" = 1
-sleep 1
 check "other jobs keep off an assigned card meanwhile" test ! -e "$GPUQ_DIR/other"
-kill $other 2>/dev/null; wait $other 2>/dev/null
+kill $other 2>/dev/null; wait $other 2>/dev/null; wait $job
 
 setup 0
 gpuq pause >/dev/null
