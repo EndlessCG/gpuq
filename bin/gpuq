@@ -11,8 +11,20 @@
 #   gpuq release [--owner PID]                          free PID's cards now (a dead PID's are ignored anyway)
 #   gpuq status                                         cards, who holds them, waiting jobs, caps
 #   gpuq cap [--total N] [--lease N] [--exclude "3 5"]  show or set the caps and the excluded cards
+#                                                       (by index, or by UUID so the exclusion follows the card)
 #   gpuq prio PID --high [--top | --pos K]              put a waiting job on the priority list (end, first, K-th)
 #   gpuq prio PID --normal | --low                      move a waiting job to the normal / low class
+#   gpuq pause [--note TEXT] / gpuq unpause             stop / resume leasing: waiting jobs keep waiting (and
+#                                                       their place), running jobs keep their cards
+#   gpuq pause PID [--note TEXT] / gpuq unpause PID     pause one WAITING job: it keeps its place but leases
+#                                                       nothing; the jobs behind it are served meanwhile
+#   gpuq assign PID GPU[,GPU...] [--override-pause | --respect-pause]
+#                                                       make a WAITING job use exactly these cards: it leases them
+#                                                       once enough are free, ahead of the queue order (caps still
+#                                                       apply), and other jobs leave them alone. While the queue is
+#                                                       paused, say whether this job may lease anyway (asked on a
+#                                                       terminal, required as a flag otherwise)
+#   gpuq assign PID --clear                             drop the assignment; the job queues normally again
 #   gpuq top [-d SEC] [--once]                          live top-like view (qtop); its keys change priorities too
 #
 #   --note: a few words saying what the job is.  --eta: how long it runs once it has its cards
@@ -82,9 +94,10 @@ class_flags() {  # sets GPU_PRIORITY_CLASS / HIGH from --low/--high
 cmd_status() {
   local cap lease idx used util holder r w p held t0 desc
   held=$(gpu_held_indices)  # once for all cards: each call runs nvidia-smi
-  local excluded; excluded=" $(gpu_excluded | tr ',\n' '  ') "
+  local excluded; excluded=" $(gpu_excluded_indices | tr '\n' ' ') "
   cap=$(gpu_cap_value); lease=$(cat "$PIDS/gpu_lease_cap" 2>/dev/null || echo "none")
-  echo "caps: total=$cap  leases=$lease (used $(gpu_reserved_count))  excluded:$(gpu_excluded | tr ',\n' '  ' | sed 's/^/ /;s/^ *$/ none/')   state: $PIDS"
+  echo "caps: total=$cap  leases=$lease (used $(gpu_reserved_count))  excluded: $(gpu_excluded | sed 's/^$/none/')   state: $PIDS"
+  [ -f "$PIDS/gpu_paused" ] && echo "PAUSED since $(head -1 "$PIDS/gpu_paused") -- no new leases ('gpuq unpause')"
   printf '%-4s %-10s %-5s %s\n' GPU MEM_MiB UTIL HOLDER
   while IFS=, read -r idx used util; do
     idx=${idx// /}; holder=""
@@ -109,11 +122,13 @@ cmd_status() {
   local prio=() normal=() low=() k=0
   if [ -f "$PIDS/gpu_priority" ]; then
     while read -r p; do
-      [ -n "$p" ] && gpu_alive "$p" && [ -f "$PIDS/gpu_waiting/$p" ] && prio+=("$p")
+      # a waiter frozen by SIGSTOP isn't competing for cards: not listed
+      [ -n "$p" ] && gpu_alive "$p" && [ -f "$PIDS/gpu_waiting/$p" ] && ! gpu_stopped "$p" && prio+=("$p")
     done < "$PIDS/gpu_priority"
   fi
   for w in $(ls -tr "$PIDS"/gpu_waiting/ 2>/dev/null); do
     gpu_alive "$w" || continue
+    gpu_stopped "$w" && continue
     [[ " ${prio[*]} " == *" $w "* ]] && continue
     if [ "$(cat "$PIDS/gpu_waiting/$w")" = low ]; then low+=("$w"); else normal+=("$w"); fi
   done
@@ -133,8 +148,22 @@ waiter_line() {  # pid label: cards needed / already reserved, time waiting, the
   age=$(( ($(date +%s) - $(stat -c %Y "$PIDS/gpu_waiting/$p")) / 60 ))
   args=$(ps -o args= -p "$p")
   [[ $args == *"gpuq run "*" -- "* ]] && args=${args#* -- }   # show the job, not the gpuq wrapper
-  printf '  %-11s pid %-8s needs %s%s  waiting %dh%02dm%s\n      %s\n' \
-    "$2" "$p" "$need" "${got:+ (holds GPU $got)}" $((age/60)) $((age%60)) "$(meta_desc "$p")" "$args"
+  local marks=""
+  [ -f "$PIDS/gpu_held/$p" ] && marks="  PAUSED ($(head -1 "$PIDS/gpu_held/$p"))"
+  [ -f "$PIDS/gpu_assign/$p" ] && marks+="  -> assigned GPU $(head -1 "$PIDS/gpu_assign/$p")"
+  grep -qx override-pause "$PIDS/gpu_assign/$p" 2>/dev/null && marks+=" (overrides queue pause)"
+  printf '  %-11s pid %-8s needs %s%s  waiting %dh%02dm%s%s\n      %s\n' \
+    "$2" "$p" "$need" "${got:+ (holds GPU $got)}" $((age/60)) $((age%60)) "$(meta_desc "$p")" "$marks" "$args"
+}
+
+# Fail now instead of waiting forever when fewer than N cards could ever be leased
+# (e.g. --gpus names only excluded cards).
+check_candidates() {
+  local n=$1 have
+  have=$(gpu_candidates | wc -l)
+  [ "$have" -ge "$n" ] && return 0
+  echo "gpuq: need $n card(s) but only $have can be leased among ${GPUQ_CANDIDATES:-all cards} (excluded: $(gpu_excluded | sed 's/^$/none/'))" >&2
+  exit 2
 }
 
 cmd_acquire() {
@@ -151,6 +180,7 @@ cmd_acquire() {
       *) class_flags "$1" || bad "unknown option $1"; shift ;;
     esac
   done
+  check_candidates "$n"
   [ -n "${NOTE+x}${ETA+x}" ] && meta_write "$owner"
   [ "${HIGH:-0}" = 1 ] && echo "$owner" >> "$PIDS/gpu_priority"
   gpu_acquire_n "$owner" "$n"
@@ -184,6 +214,7 @@ cmd_run() {
     esac
   done
   [ $# -gt 0 ] || bad "nothing to run: put the command after --"
+  check_candidates "$n"
   # This shell owns the lease, then becomes the command (exec keeps the PID): the lease lives
   # exactly as long as the job, even if it's killed with -9. While it waits, a release on exit
   # takes it out of the queue.
@@ -266,8 +297,7 @@ cmd_prio() {
 # --lease: most cards leased through gpuq at once. --exclude: cards never leased ("" clears).
 cmd_cap() {
   if [ $# -eq 0 ]; then
-    echo "total=$(gpu_cap_value)  leases=$(cat "$PIDS/gpu_lease_cap" 2>/dev/null || echo none)  excluded=$(gpu_excluded | tr ',\n' '  ' | sed 's/ *$//;s/^$/none/')"
-    return
+    cap_line; return
   fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -275,12 +305,90 @@ cmd_cap() {
       --lease) echo "$2" > "$PIDS/gpu_lease_cap"; shift 2 ;;
       --total) echo "$2" > "$PIDS/gpu_cap"; shift 2 ;;
       --exclude)
-        [[ ${2-x} =~ ^[0-9\ ,]*$ ]] || { echo "gpuq: --exclude takes card numbers, e.g. \"3\" or \"3 5\"" >&2; exit 2; }
+        local x
+        for x in ${2//,/ }; do
+          [[ $x =~ ^([0-9]+|GPU-[0-9A-Fa-f-]+)$ ]] || \
+            { echo "gpuq: --exclude takes card indices or UUIDs, e.g. \"3\", \"3 5\" or \"GPU-8f1c...\" (got '$x')" >&2; exit 2; }
+        done
         if [ -z "${2// /}" ]; then rm -f "$PIDS/gpu_exclude"; else echo "$2" > "$PIDS/gpu_exclude"; fi
         shift 2 ;;
       *) usage 1 ;;
     esac
   done
+  echo "caps now: $(cap_line)"
+}
+cap_line() {
+  echo "total=$(gpu_cap_value)  leases=$(cat "$PIDS/gpu_lease_cap" 2>/dev/null || echo none)  excluded=$(gpu_excluded | sed 's/^$/none/')"
+}
+
+# Pause: gpu_paused (whole queue) or gpu_held/PID (one waiting job) holds when, by whom, and an
+# optional note. The library leases nothing while it applies; cards already held are kept.
+cmd_pause() {
+  local note="" pid="" stamp
+  while [ $# -gt 0 ]; do
+    case "$1" in --note) note=${2:-}; shift 2 || usage 1 ;; [0-9]*) pid=$1; shift ;; *) usage 1 ;; esac
+  done
+  stamp="$(date '+%F %H:%M') by $(id -un)${note:+: $note}"
+  if [ -n "$pid" ]; then
+    # Only a waiting job: a running job already holds its cards, pausing it here would free nothing.
+    { gpu_alive "$pid" && [ -f "$PIDS/gpu_waiting/$pid" ]; } || \
+      { echo "gpuq: pid $pid is not waiting in the queue (a job pause applies to waiting jobs)" >&2; exit 2; }
+    [ -f "$PIDS/gpu_held/$pid" ] && { echo "gpuq: pid $pid already paused ($(head -1 "$PIDS/gpu_held/$pid"))"; return; }
+    echo "$stamp" > "$PIDS/gpu_held/$pid"
+    echo "gpuq: pid $pid paused ($stamp); it keeps its place, the jobs behind it go first until 'gpuq unpause $pid'"
+    return
+  fi
+  [ -f "$PIDS/gpu_paused" ] && { echo "gpuq: already paused ($(head -1 "$PIDS/gpu_paused"))"; return; }
+  echo "$stamp" > "$PIDS/gpu_paused"
+  echo "gpuq: paused ($stamp); no new leases until 'gpuq unpause'"
+}
+cmd_unpause() {
+  local pid=${1:-}
+  if [ -n "$pid" ]; then
+    [[ $pid =~ ^[0-9]+$ ]] || usage 1
+    [ -f "$PIDS/gpu_held/$pid" ] || { echo "gpuq: pid $pid is not paused"; return; }
+    rm -f "$PIDS/gpu_held/$pid"; echo "gpuq: pid $pid unpaused"
+    return
+  fi
+  [ -f "$PIDS/gpu_paused" ] || { echo "gpuq: not paused"; return; }
+  rm -f "$PIDS/gpu_paused"; echo "gpuq: unpaused; waiting jobs lease again"
+}
+
+# Assign: gpu_assign/PID holds the cards (line 1) and, if this job may lease while the queue is
+# paused, a second line "override-pause".
+cmd_assign() {
+  local p=${1:-} cards=${2:-} mode="" need all ex g n=0 ans
+  [[ $p =~ ^[0-9]+$ ]] && [ -n "$cards" ] || usage 1
+  case "${3:-}" in --override-pause) mode=override ;; --respect-pause) mode=respect ;; "") ;; *) usage 1 ;; esac
+  { gpu_alive "$p" && [ -f "$PIDS/gpu_waiting/$p" ]; } || \
+    { echo "gpuq: pid $p is not waiting in the queue (only a waiting job can be assigned cards)" >&2; exit 2; }
+  if [ "$cards" = --clear ]; then
+    rm -f "$PIDS/gpu_assign/$p"; echo "gpuq: pid $p assignment cleared; it queues normally again"; return
+  fi
+  [[ $cards =~ ^[0-9]+(,[0-9]+)*$ ]] || bad "assign takes card indices like 3 or 1,4 (got '$cards')"
+  all=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr -d ' '); ex=$(gpu_excluded_indices)
+  for g in ${cards//,/ }; do
+    grep -qx "$g" <<< "$all" || { echo "gpuq: no GPU $g on this machine" >&2; exit 2; }
+    grep -qx "$g" <<< "$ex" && { echo "gpuq: GPU $g is excluded (gpuq cap)" >&2; exit 2; }
+    n=$((n+1))
+  done
+  need=$(cat "$PIDS/gpu_need/$p" 2>/dev/null || echo 1)
+  [ "$n" -ge "$need" ] || { echo "gpuq: pid $p needs $need card(s), only $n given" >&2; exit 2; }
+  if [ -f "$PIDS/gpu_paused" ] && [ -z "$mode" ]; then
+    if [ -t 0 ]; then
+      read -r -p "gpuq: the queue is paused ($(head -1 "$PIDS/gpu_paused")). Let pid $p lease GPU $cards anyway? [y/N] " ans
+      [[ $ans == [yY]* ]] && mode=override || mode=respect
+    else
+      echo "gpuq: the queue is paused; add --override-pause (lease anyway) or --respect-pause (wait for unpause)" >&2
+      exit 2
+    fi
+  fi
+  { echo "$cards"; [ "$mode" = override ] && echo override-pause; } > "$PIDS/gpu_assign/$p"
+  if [ "$mode" = override ]; then
+    echo "gpuq: pid $p assigned to GPU $cards, overriding the queue pause; it leases them once free (needs $need)"
+  else
+    echo "gpuq: pid $p assigned to GPU $cards; it leases them once free (needs $need)${mode:+, after the queue is unpaused}"
+  fi
 }
 
 sub=${1:-}; shift || true
@@ -293,8 +401,11 @@ case "$sub" in
   status) cmd_status ;;
   cap) cmd_cap "$@" ;;
   prio) cmd_prio "$@" ;;
+  pause) cmd_pause "$@" ;;
+  unpause|resume) cmd_unpause "$@" ;;
+  assign) need_nvidia_smi; cmd_assign "$@" ;;
   top) exec "${QTOP_BIN:-$(dirname "$(realpath "$0")")/qtop}" "$@" ;;
-  --version|version) echo "gpuq 1.0.0" ;;
+  --version|version) echo "gpuq 1.1.0" ;;
   -h|--help|help|"") usage 0 ;;
   *) bad "unknown command $sub" ;;
 esac

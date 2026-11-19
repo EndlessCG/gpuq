@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """qtop: live, top-like view of the gpuq GPU queue -- cards, leases, GPU processes, waiting jobs.
 
-Reads the same state as `gpuq status` (${GPUQ_DIR:-~/.gpuq}); priority changes go through
-`gpuq prio`, so the queue logic lives in one place (lib/gpuq.sh).
+Reads the same state as `gpuq status` (${GPUQ_DIR:-~/.gpuq}); every change goes through the
+gpuq command (prio, pause, assign, cap), so the queue logic lives in one place (lib/gpuq.sh).
 
 Keys:  up/down or j/k  select a waiting job      H  high: end of the priority list
        T  top of the priority list                N / L  normal / low class
        [ / ]  move up / down in the priority list p  show / hide GPU processes
+       S  pause / unpause the selected waiting job (it keeps its place, the jobs behind it go first)
+       G  assign the selected waiting job to card(s): type e.g. 3 or 1,4, Enter (empty Enter clears);
+          while the queue is paused it then asks y/n: may this job lease despite the pause?
+       P  pause / unpause the whole queue (asks y/n): no new leases, running jobs keep their cards
+       C / A  set the total card cap / the lease cap (type a number, Enter applies, Esc cancels)
        PgUp / PgDn  scroll       r  refresh now    q  quit
 `qtop --once` prints one plain snapshot (like `top -b -n 1`).
 """
@@ -23,17 +28,17 @@ from dataclasses import dataclass, field
 
 STATE = os.environ.get("GPUQ_DIR", os.path.expanduser("~/.gpuq"))
 GPUQ = os.environ.get("GPUQ_BIN", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gpuq"))
-# The same settings lib/gpuq.sh reads: cards never leased ($GPUQ_DIR/gpu_exclude), and the used
-# memory below which a card counts as free ($GPUQ_FREE_MIB).
-def _excluded():
+# The same settings lib/gpuq.sh reads: cards never leased ($GPUQ_DIR/gpu_exclude: indices or
+# UUIDs, '#' comments), and the used memory below which a card counts as free ($GPUQ_FREE_MIB).
+def excluded_entries():
     try:
         with open(os.path.join(STATE, "gpu_exclude")) as f:
-            return {int(x) for x in f.read().replace(",", " ").split() if x.isdigit()}
+            lines = [ln for ln in f if not ln.lstrip().startswith("#")]
     except FileNotFoundError:
         return set()
+    return set(" ".join(lines).replace(",", " ").split())
 
 
-EXCLUDED = _excluded()
 HOST_LABEL = os.environ.get("GPUQ_HOST_LABEL") or socket.gethostname()  # what the header calls this machine
 FREE_MIB = int(os.environ.get("GPUQ_FREE_MIB", "5000"))
 ME = pwd.getpwuid(os.getuid()).pw_name
@@ -101,6 +106,7 @@ class Proc:
     user: str
     lstart: str
     args: str
+    stat: str = ""     # ps state; "T..." = frozen (SIGSTOP / ctrl-Z): such a waiter never polls
 
 
 @dataclass
@@ -110,9 +116,7 @@ class Gpu:
     used: float
     total: float
     util: float
-    temp: float
-    power: float
-    plimit: float
+    excluded: bool = False
     apps: list = field(default_factory=list)  # (pid, MiB)
 
 
@@ -130,21 +134,25 @@ class Snap:
     need: dict         # pid -> cards needed (str)
     arrived: dict      # pid -> arrival time
     meta: dict         # pid -> (eta, note)
+    held: dict = field(default_factory=dict)      # waiting pid -> pause stamp (gpuq pause PID)
+    assigned: dict = field(default_factory=dict)  # waiting pid -> assigned cards "1,4" (gpuq assign)
+    override: set = field(default_factory=set)    # waiting pids whose assignment overrides the queue pause
+    paused: str = None  # first line of gpu_paused ("<time> by <user>[: note]") while the queue is paused
 
 
 def collect():
     procs = {}
-    for line in sh("ps", "-ww", "-eo", "pid=,ppid=,user:32=,lstart=,args=").splitlines():
-        f = line.split(None, 8)
-        if len(f) < 8:
+    for line in sh("ps", "-ww", "-eo", "pid=,ppid=,stat=,user:32=,lstart=,args=").splitlines():
+        f = line.split(None, 9)
+        if len(f) < 9:
             continue
-        procs[int(f[0])] = Proc(int(f[0]), int(f[1]), f[2], " ".join(f[3:8]), f[8] if len(f) > 8 else "")
+        procs[int(f[0])] = Proc(int(f[0]), int(f[1]), f[3], " ".join(f[4:9]), f[9] if len(f) > 9 else "", f[2])
 
-    gpus, by_uuid = [], {}
-    q = "index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit"
+    gpus, by_uuid, ex = [], {}, excluded_entries()
+    q = "index,uuid,name,memory.used,memory.total,utilization.gpu"
     for line in sh("nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits").splitlines():
         f = [x.strip() for x in line.split(",")]
-        g = Gpu(int(f[0]), f[2].replace("NVIDIA ", ""), *(num(x) for x in f[3:9]))
+        g = Gpu(int(f[0]), f[2].replace("NVIDIA ", ""), *(num(x) for x in f[3:6]), excluded=f[0] in ex or f[1] in ex)
         gpus.append(g)
         by_uuid[f[1]] = g
     for line in sh("nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
@@ -172,6 +180,8 @@ def collect():
         if not name.isdigit() or not alive(int(name)):
             continue
         p = int(name)
+        if procs[p].stat.startswith("T"):   # frozen: not competing for cards, not listed
+            continue
         cls = read_text(os.path.join(STATE, "gpu_waiting", name))
         if cls is None:
             continue
@@ -196,9 +206,15 @@ def collect():
     queue += [(p, "normal", None) for p in rest if waiting[p] != "low"]
     queue += [(p, "low", None) for p in rest if waiting[p] == "low"]
 
+    assign = {p: (read_text(os.path.join(STATE, "gpu_assign", str(p))) or "").split() for p in waiting}
+    held = {p: (read_text(os.path.join(STATE, "gpu_held", str(p))) or "").strip() or "paused"
+            for p in waiting if os.path.exists(os.path.join(STATE, "gpu_held", str(p)))}
     cap = lambda n, default: (read_text(os.path.join(STATE, n)) or default).strip()
     return Snap(time.time(), gpus, procs, cap("gpu_cap", str(len(gpus))), cap("gpu_lease_cap", "none"), leases, lease_t0,
-                queue, waiting, need, arrived, meta)
+                queue, waiting, need, arrived, meta, held,
+                {p: a[0] for p, a in assign.items() if a},
+                {p for p, a in assign.items() if "override-pause" in a[1:]},
+                (read_text(os.path.join(STATE, "gpu_paused")) or "").strip().split("\n")[0] or None)
 
 
 # ---------------------------------------------------------------- rendering (style-tagged rows)
@@ -250,31 +266,65 @@ def eta_text(pid, snap, t0):
     return note, out
 
 
+def started_at(pid, snap):
+    """Process start time (epoch) from ps lstart, or None."""
+    pr = snap.procs.get(pid)
+    if pr is None:
+        return None
+    try:
+        return time.mktime(time.strptime(pr.lstart, "%a %b %d %H:%M:%S %Y"))
+    except ValueError:   # an unexpected ps format: show no runtime rather than a wrong one
+        return None
+
+
+def run_cols(pid, snap, t0):
+    """(RUNTIME, ETA) column texts for a job holding cards since t0 (None = not running yet)."""
+    eta = snap.meta.get(pid, ("", ""))[0]
+    if t0 is None:
+        return "-", (f"{eta} total" if eta else "-")
+    e = snap.t - t0
+    es = eta_seconds(eta) if eta else None
+    if es is None:
+        return fmt_dur(e), "-"
+    left = es - e
+    return fmt_dur(e), (f"~{fmt_dur(left)} left" if left >= 0 else f"{fmt_dur(-left)} over")
+
+
 def build_rows(snap, width, show_procs):
     rows = []
     n_leases = len(set(snap.leases))
     rows.append(Row([(f"caps: total {snap.cap_total} · leases {n_leases}/{snap.cap_lease}"
                       f" · {len(snap.queue)} waiting", "bold")]))
+    if snap.paused:
+        rows.append(Row([(f"PAUSED since {snap.paused} -- no new leases (P to unpause)", "red")]))
     rows.append(Row([("", None)]))
-    bw = max(8, min(24, (width - 78) // 2))
-    rows.append(Row([(f"{'GPU':>3}  {'MEMORY':<{bw + 13}} {'UTIL':<{bw + 5}} {'TEMP':>4} {'POWER':>5}  HOLDER",
-                      "header")]))
+    bw = 10          # bar width in cells
+    rw, ew = 8, 13   # RUNTIME / ETA column widths: fit "1d02h05m" and "~12h05m left"
+    rows.append(Row([(f"{'GPU':>3}  {'MEMORY':<{bw + 13}} {'UTIL':<{bw + 5}}  "
+                      f"{'RUNTIME':<{rw}}  {'ETA':<{ew}} HOLDER", "header")]))
     for g in snap.gpus:
         mf = g.used / g.total if g.used is not None and g.total else None
         uf = g.util / 100 if g.util is not None else None
         mem = f" {g.used / 1024:5.1f}/{g.total / 1024:3.0f}G" if mf is not None else " " * 11
         segs = [(f"{g.idx:>3}  ", "bold"), (bar(mf, bw), level(mf)), (mem + "  ", None),
                 (bar(uf, bw), level(uf)), (f" {g.util or 0:3.0f}%", None),
-                (f" {g.temp or 0:3.0f}C {g.power or 0:4.0f}W  ", "dim")]
+                ("  ", None)]
         mine = [p for p, _ in g.apps if p in snap.procs and snap.procs[p].user == ME]
-        if g.idx in EXCLUDED:
+        runtime, eta_col = "", ""
+        if g.idx in snap.leases and not g.excluded:
+            p = snap.leases[g.idx]
+            # a priority head still collecting cards isn't running yet
+            runtime, eta_col = run_cols(p, snap, None if p in snap.waiting else snap.lease_t0.get(p))
+        elif g.apps and not g.excluded:   # unleased: runtime of the oldest process on the card
+            starts = [t for t in (started_at(a, snap) for a, _ in g.apps) if t is not None]
+            runtime = fmt_dur(snap.t - min(starts)) if starts else "-"
+        segs.append((f"{runtime:<{rw}}  {eta_col:<{ew}} ", "dim"))
+        if g.excluded:
             segs.append(("excluded", "dim"))
         elif g.idx in snap.leases:
             p = snap.leases[g.idx]
-            t0 = None if p in snap.waiting else snap.lease_t0.get(p)  # head still collecting cards
-            note, eta = eta_text(p, snap, t0)
-            segs += [(f"lease {p} ", "cyan"), (note or job_args(p, snap), None),
-                     (f"  {eta}" if eta else "", "dim")]
+            note = snap.meta.get(p, ("", ""))[1]   # runtime and ETA have their own columns
+            segs += [(f"lease {p} ", "cyan"), (note or job_args(p, snap), None)]
         elif mine or g.apps:
             users = sorted({snap.procs[p].user for p, _ in g.apps if p in snap.procs})
             segs.append((f"unleased: {', '.join(users) or '?'} ({len(g.apps)} proc)", "yellow"))
@@ -312,7 +362,10 @@ def build_rows(snap, width, show_procs):
         rows.append(Row([(f"  {label:<8} ", style), (f"pid {p:<8} ", "cyan"),
                          (f"needs {snap.need[p]}{' (holds GPU ' + ','.join(map(str, held)) + ')' if held else ''}"
                           f"  waiting {wait}  ", None),
-                         (note, "bold"), (f"  {eta}" if eta else "", "dim")], pid=p))
+                         (note, "bold"), (f"  {eta}" if eta else "", "dim"),
+                         (f"  -> GPU {snap.assigned[p]}" + (" (overrides pause)" if p in snap.override else "")
+                          if p in snap.assigned else "", "green"),
+                         (f"  PAUSED ({snap.held[p]})" if p in snap.held else "", "red")], pid=p))
         rows.append(Row([("             " + job_args(p, snap), "dim")], pid=p))
     return rows
 
@@ -353,9 +406,15 @@ def put(win, y, x, text, attr, width):
     return x + len(text)
 
 
-def prio_cmd(pid, *flags):
-    r = subprocess.run([GPUQ, "prio", str(pid), *flags], capture_output=True, text=True)
-    return (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else f"exit {r.returncode}"
+def gpuq_msg(*args):
+    """Run a gpuq subcommand; its last output line becomes the status message."""
+    r = subprocess.run([GPUQ, *map(str, args)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    out = (r.stdout + r.stderr).strip()
+    return out.splitlines()[-1] if out else f"exit {r.returncode}"
+
+
+# Cap editing: key -> (gpuq cap flag, label shown in the prompt)
+CAP_KEYS = {"c": ("--total", "total card cap"), "a": ("--lease", "lease cap")}
 
 
 def tui(stdscr, delay):
@@ -364,6 +423,9 @@ def tui(stdscr, delay):
     styles = init_styles()
     snap, last = collect(), time.time()
     sel, offset, show_procs, msg = None, 0, True, ""
+    edit = None        # (target, label, typed text) while a cap or an assignment is typed
+    confirm = False    # waiting for y/n after P
+    assign_ask = None  # (pid, cards) waiting for y/n: may this assignment override the queue pause?
     while True:
         if time.time() - last >= delay:
             snap, last = collect(), time.time()
@@ -392,14 +454,71 @@ def tui(stdscr, delay):
                 x = put(stdscr, y, x, text, styles[st], w)
             if sel_idx and offset + y - 1 == sel_idx[0]:
                 put(stdscr, y, 0, "▶", styles["cyan"] | curses.A_BOLD, w)
-        keys = "↑↓ select  H high  T top  N normal  L low  [ ] move  p procs  r refresh  q quit"
-        put(stdscr, h - 1, 0, (f" {msg}   " if msg else " ") + keys, styles["dim"], w)
+        prompt = styles["yellow"] | curses.A_BOLD
+        if assign_ask:
+            put(stdscr, h - 1, 0, f" queue is paused: let pid {assign_ask[0]} lease GPU {assign_ask[1]} anyway?"
+                                  f"  y override pause / n wait for unpause / Esc cancel", prompt, w)
+        elif confirm:
+            q = "unpause the queue (leasing resumes)?" if snap.paused else \
+                "pause the queue (no new leases; running jobs keep their cards)?"
+            put(stdscr, h - 1, 0, f" {q}  y / n", prompt, w)
+        elif edit:
+            target, label, buf = edit
+            cur = snap.cap_total if target == "--total" else snap.cap_lease if target == "--lease" else \
+                snap.assigned.get(target[1], "none")
+            put(stdscr, h - 1, 0, f" set {label} (now {cur}): {buf}_   Enter apply  Esc cancel", prompt, w)
+        else:
+            keys = ("↑↓ select  H high  T top  N normal  L low  [ ] move  S pause job  G assign GPU"
+                    "  P pause all  C/A caps  p procs  r refresh  q quit")
+            put(stdscr, h - 1, 0, (f" {msg}   " if msg else " ") + keys, styles["dim"], w)
         stdscr.refresh()
 
         ch = stdscr.getch()
         if ch == -1:
             continue
         key = chr(ch) if 0 <= ch < 256 else ""
+        if assign_ask:
+            p_, cards_ = assign_ask
+            assign_ask = None
+            if key in ("y", "Y"):
+                msg = gpuq_msg("assign", p_, cards_, "--override-pause")
+            elif key in ("n", "N"):
+                msg = gpuq_msg("assign", p_, cards_, "--respect-pause")
+            else:
+                msg = f"pid {p_} assignment unchanged"
+            last = 0
+            continue
+        if confirm:
+            confirm = False
+            msg = gpuq_msg("unpause" if snap.paused else "pause") if key in ("y", "Y") else "queue state unchanged"
+            last = 0
+            continue
+        if edit:
+            target, label, buf = edit
+            if key.isdigit() or (key == "," and isinstance(target, tuple)):
+                edit = (target, label, buf + key)
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                edit = (target, label, buf[:-1])
+            elif key == "\x1b":
+                edit, msg = None, f"{label} unchanged"
+            elif ch in (curses.KEY_ENTER, 10, 13):
+                edit = None
+                if isinstance(target, tuple):   # ("assign", pid): empty input clears the assignment
+                    cards = buf.strip(",")
+                    if cards and os.path.exists(os.path.join(STATE, "gpu_paused")):
+                        assign_ask = (target[1], cards)   # ask: override the queue pause?
+                        continue
+                    msg = gpuq_msg("assign", target[1], cards or "--clear")
+                else:
+                    msg = gpuq_msg("cap", target, buf) if buf else f"{label} unchanged (nothing typed)"
+                last = 0   # show the change right away
+            continue
+        if key == "P":
+            confirm = True
+            continue
+        if key.lower() in CAP_KEYS:
+            edit = (*CAP_KEYS[key.lower()], "")
+            continue
         rank = next((rk for p, _, rk in snap.queue if p == sel), None)
         act = None
         if key in ("q", "Q", "\x1b"):
@@ -418,8 +537,13 @@ def tui(stdscr, delay):
             show_procs = not show_procs
         elif key == "r":
             last = 0
-        elif sel is None and key and key in "HhTtNnLl[]":
+        elif sel is None and key and key in "HhTtNnLl[]SsGg":
             msg = "queue is empty"
+        elif key in ("G", "g"):
+            edit = (("assign", sel), f"GPU(s) for pid {sel}", "")
+        elif key in ("S", "s"):
+            msg = gpuq_msg("unpause" if sel in snap.held else "pause", sel)
+            last = 0
         elif key in ("H", "h"):
             act = ("--high",)
         elif key in ("T", "t"):
@@ -436,7 +560,7 @@ def tui(stdscr, delay):
         elif ch == curses.KEY_RESIZE:
             pass
         if act:
-            msg = prio_cmd(sel, *act)
+            msg = gpuq_msg("prio", sel, *act)
             last = 0   # re-read the queue right away
 
 

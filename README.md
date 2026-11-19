@@ -52,7 +52,10 @@ cd gpuq
 | let a long-lived script lease cards itself | `cards=$(gpuq acquire 2 --owner $$)` (lease lasts while that PID lives) |
 | be polite | `gpuq run --low ...` waits while any normal job waits |
 | jump the queue | `gpuq run --high ...`, or `gpuq prio PID --high --top` for a job already waiting |
-| keep a card out of the queue (say, a faulty one) | `gpuq cap --exclude "3"` |
+| put a waiting job on particular cards | `gpuq assign PID 3` or `gpuq assign PID 1,4` (`--clear` undoes it) |
+| stop handing out cards for a while | `gpuq pause [--note TEXT]`, later `gpuq unpause` (running jobs keep their cards) |
+| hold back one waiting job | `gpuq pause PID` / `gpuq unpause PID` (it keeps its place; the jobs behind it go first) |
+| keep a card out of the queue (say, a faulty one) | `gpuq cap --exclude "3"`, or by UUID so it follows the card: `--exclude GPU-8f1c...` |
 | leave cards for yourself | `gpuq cap --total 6` (your jobs together hold at most 6) |
 
 `--note` is a few words saying what the job is; `--eta` is how long it runs once it has its cards
@@ -60,7 +63,9 @@ cd gpuq
 `gpuq --help` lists everything.
 
 In qtop, `↑`/`↓` select a waiting job and `H` / `T` / `N` / `L` / `[` / `]` change its priority
-(high, top, normal, low, up, down).
+(high, top, normal, low, up, down). `S` pauses or unpauses that job, `G` assigns it to cards, `P`
+pauses or unpauses the whole queue, and `C` / `A` set the total / lease caps. The card table shows
+how long each lease has run and the time left against its ETA.
 
 ## How the queue decides
 
@@ -74,7 +79,15 @@ In qtop, `↑`/`↓` select a waiting job and `H` / `T` / `N` / `L` / `[` / `]` 
    stream of small jobs can keep a big one waiting; give the big one `--high`.
 5. **Then `--low` jobs**, which wait as long as any normal job is waiting.
 
-Every change happens under one `flock`, so two jobs can never take the same card.
+Two overrides sit on top. An **assigned** job (`gpuq assign`) takes exactly its cards as soon as
+they are free, ahead of this order (the caps still apply), and other jobs leave those cards alone.
+A **paused** queue leases nothing; while it is paused, `gpuq assign` asks whether that one job may
+lease anyway. A paused job, an assigned job and a frozen one (`kill -STOP`, ctrl-Z) never block
+the jobs behind them.
+
+Every change happens under one `flock`, so two jobs can never take the same card. A waiting job
+checks every few seconds whether anything changed (a card freed, a lease ended, a cap or the
+queue changed) and tries again at once, so a freed card is taken within seconds.
 
 ## Settings
 
@@ -84,7 +97,8 @@ Every change happens under one `flock`, so two jobs can never take the same card
 | `gpuq cap --lease N` | no limit | most cards leased through gpuq at once (handy as a budget for agents) |
 | `gpuq cap --exclude "3 5"` | none | cards never leased |
 | `GPUQ_FREE_MIB` | `5000` | a card counts as free below this much used memory |
-| `GPUQ_POLL_SECONDS` | `30` | how often a waiting job looks again |
+| `GPUQ_CHECK_SECONDS` | `5` | how often a waiting job checks whether anything changed |
+| `GPUQ_POLL_SECONDS` | `30` | the longest a waiting job goes without a full retry |
 | `GPUQ_DIR` | `~/.gpuq` | where the queue's state lives |
 
 ## Tell your AI agents
@@ -109,7 +123,7 @@ Claude Code / Codex session and the experiments they launched, across all your s
 ## How it works
 
 Three files: [`bin/gpuq`](bin/gpuq) (the command), [`lib/gpuq.sh`](lib/gpuq.sh) (the queue, about
-180 lines of bash you can source from your own scripts), and [`bin/qtop`](bin/qtop) (the live
+300 lines of bash you can source from your own scripts), and [`bin/qtop`](bin/qtop) (the live
 view, Python stdlib with curses). State is a folder of tiny files, so you can always see what's
 going on with `ls ~/.gpuq` and fix it with `rm`:
 
@@ -118,6 +132,9 @@ going on with `ls ~/.gpuq` and fix it with `rm`:
 ~/.gpuq/gpu_waiting/<pid>       a waiting job and its class
 ~/.gpuq/gpu_priority            the priority list, one PID per line
 ~/.gpuq/gpu_meta/<pid>          a job's note and ETA
+~/.gpuq/gpu_assign/<pid>        cards assigned to a waiting job
+~/.gpuq/gpu_held/<pid>          a paused waiting job
+~/.gpuq/gpu_paused              present while the whole queue is paused
 ```
 
 Is it multi-user? Each user's queue lives in their own home directory, and it already steps around
